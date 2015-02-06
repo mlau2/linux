@@ -77,6 +77,7 @@ static void ip6_rt_copy_init(struct rt6_info *rt,
 			     const struct in6_addr *dest);
 static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 					   const struct in6_addr *dest);
+static void ip6_pmtu_rt_cache_update_expires(struct rt6_info *rt);
 static struct dst_entry	*ip6_dst_check(struct dst_entry *dst, u32 cookie);
 static unsigned int	 ip6_default_advmss(const struct dst_entry *dst);
 static unsigned int	 ip6_mtu(const struct dst_entry *dst);
@@ -302,10 +303,10 @@ static const struct rt6_info ip6_blk_hole_entry_template = {
 #endif
 
 /* allocate dst with ip6_dst_ops */
-static inline struct rt6_info *ip6_dst_alloc(struct net *net,
-					     struct net_device *dev,
-					     int flags,
-					     struct fib6_table *table)
+static struct rt6_info *__ip6_dst_alloc(struct net *net,
+					struct net_device *dev,
+					int flags,
+					struct fib6_table *table)
 {
 	struct rt6_info *rt = dst_alloc(&net->ipv6.ip6_dst_ops, dev,
 					0, DST_OBSOLETE_FORCE_CHK, flags);
@@ -318,6 +319,14 @@ static inline struct rt6_info *ip6_dst_alloc(struct net *net,
 		INIT_LIST_HEAD(&rt->rt6i_siblings);
 	}
 	return rt;
+}
+
+static struct rt6_info *ip6_dst_alloc(struct net *net,
+				      struct net_device *dev,
+				      int flags,
+				      struct fib6_table *table)
+{
+	return __ip6_dst_alloc(net, dev, flags, table);
 }
 
 static void ip6_dst_destroy(struct dst_entry *dst)
@@ -1948,8 +1957,8 @@ static void ip6_rt_copy_init(struct rt6_info *rt,
 static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 					   const struct in6_addr *dest)
 {
-	struct rt6_info *rt = ip6_dst_alloc(dev_net(ort->dst.dev), ort->dst.dev,
-					    0, ort->rt6i_table);
+	struct rt6_info *rt = __ip6_dst_alloc(dev_net(ort->dst.dev), ort->dst.dev,
+					      0, ort->rt6i_table);
 
 	if (!rt)
 		return NULL;
