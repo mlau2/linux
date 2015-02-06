@@ -1396,6 +1396,71 @@ int fib6_del(struct rt6_info *rt, struct nl_info *info)
 	return -ENOENT;
 }
 
+int fib6_replace(struct rt6_info *nrt, struct rt6_info *ort)
+{
+	struct net *net = dev_net(ort->dst.dev);
+	struct fib6_node *fn = ort->rt6i_node;
+	struct rt6_info **rtp;
+
+#if RT6_DEBUG >= 2
+	if (ort->dst.obsolete > 0) {
+		WARN_ON(fn);
+		return -ENOENT;
+	}
+#endif
+	if (!fn || ort == net->ipv6.ip6_null_entry)
+		return -ENOENT;
+
+	WARN_ON(!(fn->fn_flags & RTN_RTINFO));
+
+	/*
+	 *	Walk the leaf entries looking for ourself
+	 */
+	for (rtp = &fn->leaf; *rtp; rtp = &(*rtp)->dst.rt6_next) {
+		if (*rtp != ort)
+			continue;
+
+		if (ort->rt6i_nsiblings) {
+			nrt->rt6i_nsiblings = ort->rt6i_nsiblings;
+			ort->rt6i_nsiblings = 0;
+			list_replace_init(&ort->rt6i_siblings,
+					  &nrt->rt6i_siblings);
+		}
+		nrt->dst.rt6_next = (*rtp)->dst.rt6_next;
+		nrt->rt6i_node = fn;
+		atomic_inc(&nrt->rt6i_ref);
+		*rtp = nrt;
+		if (atomic_read(&ort->rt6i_ref) != 1) {
+			/* This route is used as dummy address holder in some split
+			 * nodes. It is not leaked, but it still holds other resources,
+			 * which must be released in time. So, scan ascendant nodes
+			 * and replace dummy references to this route with references
+			 * to still alive ones.
+			 */
+			while (fn) {
+				if (!(fn->fn_flags & RTN_RTINFO) && fn->leaf == ort) {
+					fn->leaf = nrt;
+					atomic_inc(&nrt->rt6i_ref);
+					rt6_release(ort);
+				}
+				fn = fn->parent;
+			}
+			/* No more references are possible at this point. */
+			BUG_ON(atomic_read(&ort->rt6i_ref) != 1);
+		}
+		if (dst_metrics_read_only(&ort->dst))
+			dst_init_metrics(&nrt->dst, dst_metrics_ptr(&ort->dst),
+					 true);
+		else
+			dst_copy_metrics(&nrt->dst, &ort->dst);
+		ort->dst.rt6_next = NULL;
+		ort->rt6i_node = NULL;
+		rt6_release(ort);
+		return 0;
+	}
+	return -ENOENT;
+}
+
 /*
  *	Tree traversal function.
  *
