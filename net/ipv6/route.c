@@ -96,6 +96,7 @@ static void		ip6_rt_update_pmtu(struct dst_entry *dst, struct sock *sk,
 static void		rt6_do_redirect(struct dst_entry *dst, struct sock *sk,
 					struct sk_buff *skb);
 static int rt6_score_route(struct rt6_info *rt, int oif, int strict);
+static void 		rt6_dst_from_metrics_check(struct rt6_info *rt);
 
 #ifdef CONFIG_IPV6_ROUTE_INFO
 static struct rt6_info *rt6_add_route_info(struct net *net,
@@ -137,9 +138,14 @@ static struct inet_peer *rt6_get_peer_create(struct rt6_info *rt)
 	return __rt6_get_peer(rt, 1);
 }
 
-static u32 *ipv6_cow_metrics(struct dst_entry *dst, unsigned long old)
+static u32 *rt6_pcpu_cow_metrics(struct rt6_info *rt)
 {
-	struct rt6_info *rt = (struct rt6_info *) dst;
+	return dst_metrics_write_ptr(rt->dst.from);
+}
+
+static u32 *rt6_cow_metrics(struct rt6_info *rt, unsigned long old)
+{
+	struct dst_entry *dst = &rt->dst;
 	struct inet_peer *peer;
 	u32 *p = NULL;
 
@@ -166,6 +172,16 @@ static u32 *ipv6_cow_metrics(struct dst_entry *dst, unsigned long old)
 		}
 	}
 	return p;
+}
+
+static u32 *ipv6_cow_metrics(struct dst_entry *dst, unsigned long old)
+{
+	struct rt6_info *rt = (struct rt6_info *)dst;
+
+	if (rt->rt6i_flags & RTF_PCPU)
+		return rt6_pcpu_cow_metrics(rt);
+	else
+		return rt6_cow_metrics(rt, old);
 }
 
 static inline const void *choose_neigh_daddr(struct rt6_info *rt,
@@ -302,10 +318,10 @@ static const struct rt6_info ip6_blk_hole_entry_template = {
 #endif
 
 /* allocate dst with ip6_dst_ops */
-static inline struct rt6_info *ip6_dst_alloc(struct net *net,
-					     struct net_device *dev,
-					     int flags,
-					     struct fib6_table *table)
+static struct rt6_info *__ip6_dst_alloc(struct net *net,
+					struct net_device *dev,
+					int flags,
+					struct fib6_table *table)
 {
 	struct rt6_info *rt = dst_alloc(&net->ipv6.ip6_dst_ops, dev,
 					0, DST_OBSOLETE_FORCE_CHK, flags);
@@ -320,6 +336,34 @@ static inline struct rt6_info *ip6_dst_alloc(struct net *net,
 	return rt;
 }
 
+static struct rt6_info *ip6_dst_alloc(struct net *net,
+				      struct net_device *dev,
+				      int flags,
+				      struct fib6_table *table)
+{
+	struct rt6_info *rt = __ip6_dst_alloc(net, dev, flags, table);
+
+	if (rt) {
+		rt->rt6i_pcpu = alloc_percpu_gfp(struct rt6_info *, GFP_ATOMIC);
+		if (rt->rt6i_pcpu) {
+			int cpu;
+
+			for_each_possible_cpu(cpu) {
+				struct rt6_info **p;
+
+				p = per_cpu_ptr(rt->rt6i_pcpu, cpu);
+				/* no one shares rt */
+				*p =  NULL;
+			}
+		} else {
+			dst_destroy((struct dst_entry *)rt);
+			return NULL;
+		}
+	}
+
+	return rt;
+}
+
 static void ip6_dst_destroy(struct dst_entry *dst)
 {
 	struct rt6_info *rt = (struct rt6_info *)dst;
@@ -328,6 +372,9 @@ static void ip6_dst_destroy(struct dst_entry *dst)
 
 	if (!(rt->dst.flags & DST_HOST))
 		dst_destroy_metrics_generic(dst);
+
+	if (rt->rt6i_pcpu)
+		free_percpu(rt->rt6i_pcpu);
 
 	if (idev) {
 		rt->rt6i_idev = NULL;
@@ -922,11 +969,72 @@ static struct rt6_info *ip6_pmtu_rt_cache_alloc(struct rt6_info *ort,
 	return rt;
 }
 
+static struct rt6_info *ip6_rt_pcpu_alloc(struct rt6_info *rt)
+{
+	struct rt6_info *pcpu_rt;
+
+	BUG_ON(rt->rt6i_flags & (RTF_CACHE | RTF_PCPU));
+
+	pcpu_rt = __ip6_dst_alloc(dev_net(rt->dst.dev),
+				  rt->dst.dev, rt->dst.flags,
+				  rt->rt6i_table);
+
+	if (!pcpu_rt)
+		return NULL;
+	ip6_rt_copy_init(pcpu_rt, rt, NULL);
+	dst_init_metrics(&pcpu_rt->dst, dst_metrics_ptr(&rt->dst), true);
+	rt6_set_from(pcpu_rt, rt);
+	pcpu_rt->rt6i_metric = rt->rt6i_metric;
+	pcpu_rt->rt6i_protocol = rt->rt6i_protocol;
+	pcpu_rt->rt6i_flags |= RTF_PCPU;
+	return pcpu_rt;
+}
+
+static struct rt6_info *rt6_get_pcpu_route(struct rt6_info *rt)
+{
+	struct rt6_info *pcpu_rt, *orig, *prev, **p;
+	struct net *net = dev_net(rt->dst.dev);
+
+	if (rt->rt6i_flags & RTF_CACHE || rt == net->ipv6.ip6_null_entry)
+		goto done;
+
+	rcu_read_lock();
+	p = raw_cpu_ptr(rt->rt6i_pcpu);
+	orig = rcu_dereference_check(*p,
+				     lockdep_is_held(&rt->rt6i_table->tb6_lock));
+	if (orig) {
+		rt6_dst_from_metrics_check(orig);
+		dst_hold(&orig->dst);
+		rcu_read_unlock();
+		return orig;
+	}
+	rcu_read_unlock();
+
+	pcpu_rt = ip6_rt_pcpu_alloc(rt);
+	if (!pcpu_rt) {
+		rt = net->ipv6.ip6_null_entry;
+		goto done;
+	}
+
+	prev = cmpxchg(p, orig, pcpu_rt);
+	if (prev == orig) {
+		if (orig)
+			call_rcu(&orig->dst.rcu_head, dst_rcu_free);
+	} else {
+		pcpu_rt->dst.flags |= DST_NOCACHE;
+	}
+	rt = pcpu_rt;
+
+done:
+	dst_hold(&rt->dst);
+	return rt;
+}
+
 static struct rt6_info *ip6_pol_route(struct net *net, struct fib6_table *table, int oif,
 				      struct flowi6 *fl6, int flags)
 {
 	struct fib6_node *fn, *saved_fn;
-	struct rt6_info *rt;
+	struct rt6_info *rt, *pcpu_rt;
 	int strict = 0;
 
 	strict |= flags & RT6_LOOKUP_F_IFACE;
@@ -954,13 +1062,13 @@ redo_rt6_select:
 		}
 	}
 
-	dst_hold(&rt->dst);
+	pcpu_rt = rt6_get_pcpu_route(rt);
 	read_unlock_bh(&table->tb6_lock);
 
 	rt->dst.lastuse = jiffies;
 	rt->dst.__use++;
 
-	return rt;
+	return pcpu_rt;
 }
 
 static struct rt6_info *ip6_pol_route_input(struct net *net, struct fib6_table *table,
@@ -1065,6 +1173,33 @@ struct dst_entry *ip6_blackhole_route(struct net *net, struct dst_entry *dst_ori
  *	Destination cache support functions
  */
 
+static void rt6_dst_from_metrics_check(struct rt6_info *rt)
+{
+	if (dst_metrics_ptr(&rt->dst) != dst_metrics_ptr(rt->dst.from))
+		dst_init_metrics(&rt->dst, dst_metrics_ptr(rt->dst.from), true);
+}
+
+static struct dst_entry *rt6_check(struct rt6_info *rt, u32 cookie)
+{
+	if (!rt->rt6i_node || rt->rt6i_node->fn_sernum != cookie)
+		return NULL;
+
+	if (rt6_check_expired(rt))
+		return NULL;
+
+	return &rt->dst;
+}
+
+static struct dst_entry *rt6_pcpu_check(struct rt6_info *rt, u32 cookie)
+{
+	if (rt->dst.obsolete == DST_OBSOLETE_FORCE_CHK) {
+		rt6_dst_from_metrics_check(rt);
+		if (rt6_check((struct rt6_info *)(rt->dst.from), cookie))
+			return &rt->dst;
+	}
+	return NULL;
+}
+
 static struct dst_entry *ip6_dst_check(struct dst_entry *dst, u32 cookie)
 {
 	struct rt6_info *rt;
@@ -1075,13 +1210,10 @@ static struct dst_entry *ip6_dst_check(struct dst_entry *dst, u32 cookie)
 	 * DST_OBSOLETE_FORCE_CHK which forces validation calls down
 	 * into this function always.
 	 */
-	if (!rt->rt6i_node || (rt->rt6i_node->fn_sernum != cookie))
-		return NULL;
-
-	if (rt6_check_expired(rt))
-		return NULL;
-
-	return dst;
+	if (rt->rt6i_flags & RTF_PCPU)
+		return rt6_pcpu_check(rt, cookie);
+	else
+		return rt6_check(rt, cookie);
 }
 
 static struct dst_entry *ip6_negative_advice(struct dst_entry *dst)
@@ -1973,8 +2105,13 @@ static void ip6_rt_copy_init(struct rt6_info *rt,
 static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 					   const struct in6_addr *dest)
 {
-	struct rt6_info *rt = ip6_dst_alloc(dev_net(ort->dst.dev), ort->dst.dev,
-					    0, ort->rt6i_table);
+	struct rt6_info *rt;
+
+	if (ort->rt6i_flags & RTF_PCPU)
+		ort = (struct rt6_info *)ort->dst.from;
+
+	rt = __ip6_dst_alloc(dev_net(ort->dst.dev), ort->dst.dev,
+			     0, ort->rt6i_table);
 
 	if (!rt)
 		return NULL;
