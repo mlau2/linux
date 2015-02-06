@@ -91,6 +91,11 @@ struct rt6key {
 
 struct fib6_table;
 
+struct rt6_shinfo {
+	atomic_t	ref;
+	unsigned long	expires;
+};
+
 struct rt6_info {
 	struct dst_entry		dst;
 
@@ -127,6 +132,7 @@ struct rt6_info {
 	/* more non-fragment space at head required */
 	unsigned short			rt6i_nfheader_len;
 	u8				rt6i_protocol;
+	struct rt6_shinfo		*rt6shi;
 };
 
 static inline struct inet_peer *rt6_peer_ptr(struct rt6_info *rt)
@@ -168,34 +174,16 @@ static inline void rt6_clean_expires(struct rt6_info *rt)
 {
 	rt->rt6i_flags &= ~RTF_EXPIRES;
 	rt->dst.expires = 0;
+	if (!(rt->rt6i_flags & RTF_CACHE))
+		rt->rt6shi->expires = 0;
 }
 
 static inline void rt6_set_expires(struct rt6_info *rt, unsigned long expires)
 {
 	rt->dst.expires = expires;
+	if (!(rt->rt6i_flags & RTF_CACHE))
+		rt->rt6shi->expires = expires;
 	rt->rt6i_flags |= RTF_EXPIRES;
-}
-
-static inline void rt6_update_expires(struct rt6_info *rt0, int timeout)
-{
-	struct rt6_info *rt;
-
-	for (rt = rt0; rt && !(rt->rt6i_flags & RTF_EXPIRES);
-	     rt = (struct rt6_info *)rt->dst.from);
-	if (rt && rt != rt0)
-		rt0->dst.expires = rt->dst.expires;
-
-	dst_set_expires(&rt0->dst, timeout);
-	rt0->rt6i_flags |= RTF_EXPIRES;
-}
-
-static inline void rt6_set_from(struct rt6_info *rt, struct rt6_info *from)
-{
-	struct dst_entry *new = (struct dst_entry *) from;
-
-	rt->rt6i_flags &= ~RTF_EXPIRES;
-	dst_hold(new);
-	rt->dst.from = new;
 }
 
 static inline void ip6_rt_put(struct rt6_info *rt)
