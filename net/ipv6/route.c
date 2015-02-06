@@ -77,6 +77,7 @@ static void ip6_rt_copy_init(struct rt6_info *rt,
 			     const struct in6_addr *dest);
 static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 					   const struct in6_addr *dest);
+static void ip6_pmtu_rt_cache_update_expires(struct rt6_info *rt);
 static struct dst_entry	*ip6_dst_check(struct dst_entry *dst, u32 cookie);
 static unsigned int	 ip6_default_advmss(const struct dst_entry *dst);
 static unsigned int	 ip6_mtu(const struct dst_entry *dst);
@@ -302,10 +303,10 @@ static const struct rt6_info ip6_blk_hole_entry_template = {
 #endif
 
 /* allocate dst with ip6_dst_ops */
-static inline struct rt6_info *ip6_dst_alloc(struct net *net,
-					     struct net_device *dev,
-					     int flags,
-					     struct fib6_table *table)
+static struct rt6_info *__ip6_dst_alloc(struct net *net,
+					struct net_device *dev,
+					int flags,
+					struct fib6_table *table)
 {
 	struct rt6_info *rt = dst_alloc(&net->ipv6.ip6_dst_ops, dev,
 					0, DST_OBSOLETE_FORCE_CHK, flags);
@@ -316,6 +317,29 @@ static inline struct rt6_info *ip6_dst_alloc(struct net *net,
 		memset(dst + 1, 0, sizeof(*rt) - sizeof(*dst));
 		rt6_init_peer(rt, table ? &table->tb6_peers : net->ipv6.peers);
 		INIT_LIST_HEAD(&rt->rt6i_siblings);
+	}
+	return rt;
+}
+
+static struct rt6_info *ip6_dst_alloc(struct net *net,
+				      struct net_device *dev,
+				      int flags,
+				      struct fib6_table *table)
+{
+	struct rt6_info *rt = __ip6_dst_alloc(net, dev, flags, table);
+
+	if (rt) {
+		struct rt6i_shared_info *rt6i_shi;
+
+		rt6i_shi = kmalloc(sizeof(*rt6i_shi), GFP_ATOMIC);
+		if (rt6i_shi) {
+			atomic_set(&rt6i_shi->ref, 1);
+			rt6i_shi->expires = 0;
+			rt->rt6i_shi = rt6i_shi;
+		} else {
+			dst_destroy((struct dst_entry *)rt);
+			rt = NULL;
+		}
 	}
 	return rt;
 }
@@ -341,6 +365,8 @@ static void ip6_dst_destroy(struct dst_entry *dst)
 		struct inet_peer *peer = rt6_peer_ptr(rt);
 		inet_putpeer(peer);
 	}
+	if (rt->rt6i_shi && atomic_dec_and_test(&rt->rt6i_shi->ref))
+		kfree(rt->rt6i_shi);
 }
 
 static void ip6_dst_ifdown(struct dst_entry *dst, struct net_device *dev,
@@ -368,8 +394,11 @@ static bool rt6_check_expired(const struct rt6_info *rt)
 	if (rt->rt6i_flags & RTF_EXPIRES) {
 		if (time_after(jiffies, rt->dst.expires))
 			return true;
-	} else if (rt->dst.from) {
-		return rt6_check_expired((struct rt6_info *) rt->dst.from);
+	} else if (rt->rt6i_flags & RTF_CACHE) {
+		unsigned long parent_expires = rt->rt6i_shi->expires;
+
+		if (parent_expires && time_after(jiffies, parent_expires))
+			return true;
 	}
 	return false;
 }
@@ -1146,14 +1175,12 @@ static void ip6_rt_update_pmtu(struct dst_entry *dst, struct sock *sk,
 
 	dst_confirm(dst);
 	if (mtu < dst_mtu(dst) && rt6->rt6i_dst.plen == 128) {
-		struct net *net = dev_net(dst->dev);
-
 		rt6->rt6i_flags |= RTF_MODIFIED;
 		if (mtu < IPV6_MIN_MTU)
 			mtu = IPV6_MIN_MTU;
 
 		dst_metric_set(dst, RTAX_MTU, mtu);
-		rt6_update_expires(rt6, net->ipv6.sysctl.ip6_rt_mtu_expires);
+		ip6_pmtu_rt_cache_update_expires(rt6);
 	}
 }
 
@@ -1905,6 +1932,14 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
 	call_netevent_notifiers(NETEVENT_REDIRECT, &netevent);
 
 	if (rt->rt6i_flags & RTF_CACHE) {
+		if (rt->rt6i_flags & RTF_EXPIRES) {
+			/* nrt is copied from a route that has
+			 * (RTF_CACHE|RTF_EXPIRES) set. rt was created
+			 * during update_pmtu() and nrt should use
+			 * its mtu expiration.
+			 */
+			rt6_set_expires(nrt, rt->dst.expires);
+		}
 		rt = (struct rt6_info *) dst_clone(&rt->dst);
 		ip6_del_rt(rt);
 	}
@@ -1916,6 +1951,17 @@ out:
 /*
  *	Misc support functions
  */
+
+static void ip6_pmtu_rt_cache_update_expires(struct rt6_info *rt)
+{
+	struct net *net = dev_net(rt->dst.dev);
+	unsigned long parent_expires = rt->rt6i_shi->expires;
+	unsigned long pmtu_expires = jiffies +
+		net->ipv6.sysctl.ip6_rt_mtu_expires;
+	if (parent_expires && time_before(parent_expires, pmtu_expires))
+		pmtu_expires = parent_expires;
+	rt6_set_expires(rt, pmtu_expires);
+}
 
 static void ip6_rt_copy_init(struct rt6_info *rt,
 			     struct rt6_info *ort,
@@ -1943,20 +1989,22 @@ static void ip6_rt_copy_init(struct rt6_info *rt,
 #endif
 	rt->rt6i_prefsrc = ort->rt6i_prefsrc;
 	rt->rt6i_table = ort->rt6i_table;
+	atomic_inc(&ort->rt6i_shi->ref);
+	rt->rt6i_shi = ort->rt6i_shi;
 }
 
 static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 					   const struct in6_addr *dest)
 {
-	struct rt6_info *rt = ip6_dst_alloc(dev_net(ort->dst.dev), ort->dst.dev,
-					    0, ort->rt6i_table);
+	struct rt6_info *rt = __ip6_dst_alloc(dev_net(ort->dst.dev), ort->dst.dev,
+					      0, ort->rt6i_table);
 
 	if (!rt)
 		return NULL;
 	ip6_rt_copy_init(rt, ort, dest);
 	dst_copy_metrics(&rt->dst, &ort->dst);
 	rt->rt6i_flags |= RTF_CACHE;
-	rt6_set_from(rt, ort);
+	rt6_clean_expires(rt);
 	rt->rt6i_metric = 0;
 	return rt;
 }
