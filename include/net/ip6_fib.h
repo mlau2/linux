@@ -287,6 +287,7 @@ void fib6_clean_all(struct net *net, int (*func)(struct rt6_info *, void *arg),
 int fib6_add(struct fib6_node *root, struct rt6_info *rt,
 	     struct nl_info *info, struct mx6_config *mxc);
 int fib6_del(struct rt6_info *rt, struct nl_info *info);
+int fib6_replace(struct rt6_info *nrt, struct rt6_info *ort);
 
 void inet6_rt_notify(int event, struct rt6_info *rt, struct nl_info *info);
 
