@@ -124,6 +124,7 @@ struct rt6_info {
 	unsigned long			_rt6i_peer;
 
 	u32				rt6i_metric;
+	struct rt6_info __rcu * __percpu	*rt6i_percpu_cache;
 	/* more non-fragment space at head required */
 	unsigned short			rt6i_nfheader_len;
 	u8				rt6i_protocol;
@@ -196,6 +197,13 @@ static inline void rt6_set_from(struct rt6_info *rt, struct rt6_info *from)
 	rt->rt6i_flags &= ~RTF_EXPIRES;
 	dst_hold(new);
 	rt->dst.from = new;
+}
+
+static inline u32 rt6_get_cookie(const struct rt6_info *rt)
+{
+	if (rt->rt6i_flags & RTF_PERCPU_CACHE)
+		rt = (struct rt6_info *)(rt->dst.from);
+	return rt->rt6i_node ? rt->rt6i_node->fn_sernum : 0;
 }
 
 static inline void ip6_rt_put(struct rt6_info *rt)

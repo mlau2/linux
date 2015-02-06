@@ -154,10 +154,30 @@ static void node_free(struct fib6_node *fn)
 	kmem_cache_free(fib6_node_kmem, fn);
 }
 
+static void rt6_free_percpu_cache(struct rt6_info *non_percpu_rt)
+{
+       int cpu;
+
+       for_each_possible_cpu(cpu) {
+	       struct rt6_info **ppercpu_rt;
+	       struct rt6_info *percpu_rt;
+
+		/* write lock has been acquired */
+	       ppercpu_rt = per_cpu_ptr(non_percpu_rt->rt6i_percpu_cache, cpu);
+	       percpu_rt = *ppercpu_rt;
+	       if (percpu_rt) {
+		       dst_free(&percpu_rt->dst);
+		       *ppercpu_rt = NULL;
+	       }
+       }
+}
+
 static void rt6_release(struct rt6_info *rt)
 {
-	if (atomic_dec_and_test(&rt->rt6i_ref))
+	if (atomic_dec_and_test(&rt->rt6i_ref)) {
+		rt6_free_percpu_cache(rt);
 		dst_free(&rt->dst);
+	}
 }
 
 static void fib6_link_table(struct net *net, struct fib6_table *tb)
