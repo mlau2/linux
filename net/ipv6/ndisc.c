@@ -1370,9 +1370,6 @@ skip_routeinfo:
 		} else if (in6_dev->cnf.mtu6 != mtu) {
 			in6_dev->cnf.mtu6 = mtu;
 
-			if (rt)
-				dst_metric_set(&rt->dst, RTAX_MTU, mtu);
-
 			rt6_mtu_change(skb->dev, mtu);
 		}
 	}
