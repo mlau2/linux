@@ -350,7 +350,7 @@ static void ip6_dst_destroy(struct dst_entry *dst)
 	struct inet6_dev *idev = rt->rt6i_idev;
 	struct dst_entry *from = dst->from;
 
-	if (!(rt->dst.flags & DST_HOST))
+	if (!(rt->dst.flags & DST_HOST) || !rt6_has_peer(rt))
 		dst_destroy_metrics_generic(dst);
 
 	if (idev) {
@@ -2062,6 +2062,8 @@ static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 	if (!rt)
 		return NULL;
 	ip6_rt_copy_init(rt, ort, dest);
+	if (ort->dst.flags & DST_HOST)
+		dst_cow_metrics_generic(&rt->dst, rt->dst._metrics);
 	dst_copy_metrics(&rt->dst, &ort->dst);
 	rt->rt6i_flags |= RTF_CACHE;
 	rt6_clean_expires(rt);
