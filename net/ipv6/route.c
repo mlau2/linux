@@ -2054,6 +2054,8 @@ static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 	if (!rt)
 		return NULL;
 	ip6_rt_copy_init(rt, ort, dest);
+	if ((ort->dst.flags & DST_HOST))
+		dst_cow_metrics_generic(&rt->dst, rt->dst._metrics);
 	dst_copy_metrics(&rt->dst, &ort->dst);
 	rt->rt6i_flags |= RTF_CACHE;
 	rt6_clean_expires(rt);
