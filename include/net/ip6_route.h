@@ -99,6 +99,7 @@ struct rt6_info *addrconf_dst_alloc(struct inet6_dev *idev,
  */
 struct rt6_info *rt6_get_dflt_router(const struct in6_addr *addr,
 				     struct net_device *dev);
+struct rt6_info *rt6_update_dflt_router(struct rt6_info *rt, u32 hoplimit);
 struct rt6_info *rt6_add_dflt_router(const struct in6_addr *gwaddr,
 				     struct net_device *dev, unsigned int pref);
 

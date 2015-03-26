@@ -1235,8 +1235,8 @@ static void ndisc_router_discovery(struct sk_buff *skb)
 			ND_PRINTK(2, warn, "RA: Got route advertisement with lower hop_limit than current\n");
 		}
 		if (rt)
-			dst_metric_set(&rt->dst, RTAX_HOPLIMIT,
-				       ra_msg->icmph.icmp6_hop_limit);
+			rt = rt6_update_dflt_router(rt,
+						    ra_msg->icmph.icmp6_hop_limit);
 	}
 
 skip_defrtr:
