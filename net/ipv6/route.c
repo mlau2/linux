@@ -1174,14 +1174,15 @@ static void ip6_rt_update_pmtu(struct dst_entry *dst, struct sock *sk,
 {
 	struct rt6_info *rt6 = (struct rt6_info *)dst;
 
+	if (rt6->rt6i_flags & RTF_LOCAL)
+		return;
+
 	dst_confirm(dst);
 	mtu = max_t(u32, mtu, IPV6_MIN_MTU);
 	if (mtu >= dst_mtu(dst))
 		return;
 
-	if (!(rt6->rt6i_flags & RTF_CACHE) &&
-	    (!(rt6->rt6i_flags & (RTF_NONEXTHOP | RTF_GATEWAY)) ||
-	     !(rt6->dst.flags & DST_HOST))) {
+	if (!(rt6->rt6i_flags & RTF_CACHE)) {
 		struct rt6_info *nrt6;
 		const struct in6_addr *daddr, *saddr;
 
@@ -1210,11 +1211,9 @@ static void ip6_rt_update_pmtu(struct dst_entry *dst, struct sock *sk,
 		rt6 = (struct rt6_info *)dst;
 	}
 
-	if (rt6->rt6i_dst.plen == 128) {
-		rt6->rt6i_flags |= RTF_MODIFIED;
-		dst_metric_set(dst, RTAX_MTU, mtu);
-		ip6_pmtu_rt_cache_update_expires(rt6);
-	}
+	rt6->rt6i_flags |= RTF_MODIFIED;
+	dst_metric_set(dst, RTAX_MTU, mtu);
+	ip6_pmtu_rt_cache_update_expires(rt6);
 }
 
 void ip6_update_pmtu(struct sk_buff *skb, struct net *net, __be32 mtu,
