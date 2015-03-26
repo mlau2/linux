@@ -1225,15 +1225,17 @@ static void ip6_rt_update_pmtu(struct dst_entry *dst, struct sock *sk,
 			       struct sk_buff *skb, u32 mtu)
 {
 	struct rt6_info *rt6 = (struct rt6_info *)dst;
+	struct net *net;
+
+	if (rt6->rt6i_flags & RTF_LOCAL)
+		return;
 
 	dst_confirm(dst);
 	mtu = max_t(u32, mtu, IPV6_MIN_MTU);
 	if (mtu >= dst_mtu(dst))
 		return;
 
-	if (!(rt6->rt6i_flags & RTF_CACHE) &&
-	    (!(rt6->rt6i_flags & (RTF_NONEXTHOP | RTF_GATEWAY)) ||
-	     !(rt6->dst.flags & DST_HOST))) {
+	if (!(rt6->rt6i_flags & RTF_CACHE)) {
 		const struct in6_addr *daddr, *saddr;
 		struct rt6_info *nrt6;
 
@@ -1265,20 +1267,12 @@ static void ip6_rt_update_pmtu(struct dst_entry *dst, struct sock *sk,
 		dst = &nrt6->dst;
 	} else {
 		rt6 = (struct rt6_info *)dst;
-		if (rt6->rt6i_flags & RTF_PERCPU_CACHE) {
-			dst = rt6->dst.from;
-			rt6 = (struct rt6_info *)dst;
-		}
 	}
 
-	if (rt6->rt6i_dst.plen == 128) {
-		struct net *net;
-
-		net = dev_net(rt6->dst.dev);
-		rt6->rt6i_flags |= RTF_MODIFIED;
-		dst_metric_set(dst, RTAX_MTU, mtu);
-		rt6_update_expires(rt6, net->ipv6.sysctl.ip6_rt_mtu_expires);
-	}
+	net = dev_net(rt6->dst.dev);
+	rt6->rt6i_flags |= RTF_MODIFIED;
+	dst_metric_set(dst, RTAX_MTU, mtu);
+	rt6_update_expires(rt6, net->ipv6.sysctl.ip6_rt_mtu_expires);
 }
 
 void ip6_update_pmtu(struct sk_buff *skb, struct net *net, __be32 mtu,
