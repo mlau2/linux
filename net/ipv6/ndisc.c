@@ -1228,8 +1228,8 @@ static void ndisc_router_discovery(struct sk_buff *skb)
 	if (ra_msg->icmph.icmp6_hop_limit) {
 		in6_dev->cnf.hop_limit = ra_msg->icmph.icmp6_hop_limit;
 		if (rt)
-			dst_metric_set(&rt->dst, RTAX_HOPLIMIT,
-				       ra_msg->icmph.icmp6_hop_limit);
+			rt = rt6_update_dflt_router(rt,
+						    ra_msg->icmph.icmp6_hop_limit);
 	}
 
 skip_defrtr:
