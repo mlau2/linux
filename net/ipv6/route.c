@@ -2103,16 +2103,11 @@ static struct rt6_info *rt6_add_route_info(struct net *net,
 }
 #endif
 
-struct rt6_info *rt6_get_dflt_router(const struct in6_addr *addr, struct net_device *dev)
+static struct rt6_info *__rt6_get_dflt_router(const struct in6_addr *addr, struct net_device *dev,
+					      struct fib6_table *table)
 {
 	struct rt6_info *rt;
-	struct fib6_table *table;
 
-	table = fib6_get_table(dev_net(dev), RT6_TABLE_DFLT);
-	if (!table)
-		return NULL;
-
-	read_lock_bh(&table->tb6_lock);
 	for (rt = table->tb6_root.leaf; rt; rt = rt->dst.rt6_next) {
 		if (dev == rt->dst.dev &&
 		    ((rt->rt6i_flags & (RTF_ADDRCONF | RTF_DEFAULT)) == (RTF_ADDRCONF | RTF_DEFAULT)) &&
@@ -2121,7 +2116,42 @@ struct rt6_info *rt6_get_dflt_router(const struct in6_addr *addr, struct net_dev
 	}
 	if (rt)
 		dst_hold(&rt->dst);
+	return rt;
+}
+
+struct rt6_info *rt6_get_dflt_router(const struct in6_addr *addr, struct net_device *dev)
+{
+	struct fib6_table *table;
+	struct rt6_info *rt;
+
+	table = fib6_get_table(dev_net(dev), RT6_TABLE_DFLT);
+	if (!table)
+		return NULL;
+
+	read_lock_bh(&table->tb6_lock);
+	rt = __rt6_get_dflt_router(addr, dev, table);
 	read_unlock_bh(&table->tb6_lock);
+	return rt;
+}
+
+struct rt6_info *rt6_update_dflt_router(struct rt6_info *rt, u32 hoplimit)
+{
+	struct fib6_table *table;
+
+	if (dst_metric_raw(&rt->dst, RTAX_HOPLIMIT) == hoplimit)
+		return rt;
+
+	table = rt->rt6i_table;
+	read_lock_bh(&table->tb6_lock);
+	if (!rt->rt6i_node) {
+		ip6_rt_put(rt);
+		rt = __rt6_get_dflt_router(&rt->rt6i_gateway, rt->dst.dev,
+					   table);
+	}
+	if (rt)
+		dst_metric_set(&rt->dst, RTAX_HOPLIMIT, hoplimit);
+	read_unlock_bh(&table->tb6_lock);
+
 	return rt;
 }
 
