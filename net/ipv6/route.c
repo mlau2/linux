@@ -348,8 +348,15 @@ static void ip6_dst_destroy(struct dst_entry *dst)
 {
 	struct rt6_info *rt = (struct rt6_info *)dst;
 	struct inet6_dev *idev = rt->rt6i_idev;
+	unsigned long peer_metrics = 0;
 
-	if (!(rt->dst.flags & DST_HOST))
+	if (rt6_has_peer(rt)) {
+		struct inet_peer *peer = rt6_peer_ptr(rt);
+		peer_metrics = (unsigned long)peer->metrics;
+		inet_putpeer(peer);
+	}
+
+	if (peer_metrics != dst->_metrics)
 		dst_destroy_metrics_generic(dst);
 
 	if (idev) {
@@ -357,10 +364,6 @@ static void ip6_dst_destroy(struct dst_entry *dst)
 		in6_dev_put(idev);
 	}
 
-	if (rt6_has_peer(rt)) {
-		struct inet_peer *peer = rt6_peer_ptr(rt);
-		inet_putpeer(peer);
-	}
 	if (rt->rt6i_shi && atomic_dec_and_test(&rt->rt6i_shi->ref))
 		kfree(rt->rt6i_shi);
 }
@@ -2058,6 +2061,8 @@ static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 	if (!rt)
 		return NULL;
 	ip6_rt_copy_init(rt, ort, dest);
+	if (ort->dst.flags & DST_HOST)
+		dst_cow_metrics_generic(&rt->dst, rt->dst._metrics);
 	dst_copy_metrics(&rt->dst, &ort->dst);
 	rt->rt6i_flags |= RTF_CACHE;
 	rt6_clean_expires(rt);
