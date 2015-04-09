@@ -907,16 +907,13 @@ static struct rt6_info *ip6_pol_route(struct net *net, struct fib6_table *table,
 				      struct flowi6 *fl6, int flags)
 {
 	struct fib6_node *fn, *saved_fn;
-	struct rt6_info *rt, *nrt;
+	struct rt6_info *rt;
 	int strict = 0;
-	int attempts = 3;
-	int err;
 
 	strict |= flags & RT6_LOOKUP_F_IFACE;
 	if (net->ipv6.devconf_all->forwarding == 0)
 		strict |= RT6_LOOKUP_F_REACHABLE;
 
-redo_fib6_lookup_lock:
 	read_lock_bh(&table->tb6_lock);
 
 	fn = fib6_lookup(&table->tb6_root, &fl6->daddr, &fl6->saddr);
@@ -935,46 +932,12 @@ redo_rt6_select:
 			strict &= ~RT6_LOOKUP_F_REACHABLE;
 			fn = saved_fn;
 			goto redo_rt6_select;
-		} else {
-			dst_hold(&rt->dst);
-			read_unlock_bh(&table->tb6_lock);
-			goto out2;
 		}
 	}
 
 	dst_hold(&rt->dst);
 	read_unlock_bh(&table->tb6_lock);
 
-	if (rt->rt6i_flags & RTF_CACHE)
-		goto out2;
-
-	if (!(rt->rt6i_flags & (RTF_NONEXTHOP | RTF_GATEWAY)) ||
-	    !(rt->dst.flags & DST_HOST))
-		nrt = ip6_pmtu_rt_cache_alloc(rt, &fl6->daddr, &fl6->saddr);
-	else
-		goto out2;
-
-	ip6_rt_put(rt);
-	rt = nrt ? : net->ipv6.ip6_null_entry;
-
-	dst_hold(&rt->dst);
-	if (nrt) {
-		err = ip6_ins_rt(nrt);
-		if (!err)
-			goto out2;
-	}
-
-	if (--attempts <= 0)
-		goto out2;
-
-	/*
-	 * Race condition! In the gap, when table->tb6_lock was
-	 * released someone could insert this route.  Relookup.
-	 */
-	ip6_rt_put(rt);
-	goto redo_fib6_lookup_lock;
-
-out2:
 	rt->dst.lastuse = jiffies;
 	rt->dst.__use++;
 
@@ -1144,13 +1107,50 @@ static void ip6_rt_update_pmtu(struct dst_entry *dst, struct sock *sk,
 	struct rt6_info *rt6 = (struct rt6_info *)dst;
 
 	dst_confirm(dst);
-	if (mtu < dst_mtu(dst) && rt6->rt6i_dst.plen == 128) {
+	mtu = max_t(u32, mtu, IPV6_MIN_MTU);
+	if (mtu >= dst_mtu(dst))
+		return;
+
+	if (!(rt6->rt6i_flags & RTF_CACHE) &&
+	    (!(rt6->rt6i_flags & (RTF_NONEXTHOP | RTF_GATEWAY)) ||
+	     !(rt6->dst.flags & DST_HOST))) {
+		const struct in6_addr *daddr, *saddr;
+		struct rt6_info *nrt6;
+
+		if (skb) {
+			const struct ipv6hdr *iph = ipv6_hdr(skb);
+
+			daddr = &iph->daddr;
+			saddr = &iph->saddr;
+		} else if (sk) {
+			daddr = &sk->sk_v6_daddr;
+			saddr = &inet6_sk(sk)->saddr;
+		} else {
+			return;
+		}
+		nrt6 = ip6_pmtu_rt_cache_alloc(rt6, daddr, saddr);
+		if (!nrt6)
+			return;
+		/* flushing rt6->rt6i_pcpu is not needed because
+		 * ip6_ins_rt(nrt6) will bump the rt6->rt6i_node->fn_sernum
+		 * which will fail the next rt6_check() and invalidate the
+		 * sk->sk_dst_cache.
+		 */
+		if (ip6_ins_rt(nrt6)) {
+			dst_destroy(&nrt6->dst);
+			return;
+		}
+
+		rt6 = nrt6;
+		dst = &nrt6->dst;
+	} else {
+		rt6 = (struct rt6_info *)dst;
+	}
+
+	if (rt6->rt6i_dst.plen == 128) {
 		struct net *net = dev_net(dst->dev);
 
 		rt6->rt6i_flags |= RTF_MODIFIED;
-		if (mtu < IPV6_MIN_MTU)
-			mtu = IPV6_MIN_MTU;
-
 		dst_metric_set(dst, RTAX_MTU, mtu);
 		rt6_update_expires(rt6, net->ipv6.sysctl.ip6_rt_mtu_expires);
 	}
@@ -1171,8 +1171,15 @@ void ip6_update_pmtu(struct sk_buff *skb, struct net *net, __be32 mtu,
 	fl6.flowlabel = ip6_flowinfo(iph);
 
 	dst = ip6_route_output(net, NULL, &fl6);
-	if (!dst->error)
+	if (!dst->error) {
+		unsigned char *outer_network_header = skb_network_header(skb);
+		int offset;
+
+		skb_reset_network_header(skb);
+		offset = outer_network_header - skb_network_header(skb);
 		ip6_rt_update_pmtu(dst, NULL, skb, ntohl(mtu));
+		skb_set_network_header(skb, offset);
+	}
 	dst_release(dst);
 }
 EXPORT_SYMBOL_GPL(ip6_update_pmtu);
