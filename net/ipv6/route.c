@@ -1957,6 +1957,8 @@ static struct rt6_info *ip6_rt_copy(struct rt6_info *ort,
 
 		rt->rt6i_dst.addr = *dest;
 		rt->rt6i_dst.plen = 128;
+		if (ort->dst.flags & DST_HOST)
+			dst_cow_metrics_generic(&rt->dst, rt->dst._metrics);
 		dst_copy_metrics(&rt->dst, &ort->dst);
 		rt->dst.error = ort->dst.error;
 		rt->rt6i_idev = ort->rt6i_idev;
