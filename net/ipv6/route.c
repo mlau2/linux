@@ -143,45 +143,16 @@ static u32 *rt6_pcpu_cow_metrics(struct rt6_info *rt)
 	return dst_metrics_write_ptr(rt->dst.from);
 }
 
-static u32 *rt6_cow_metrics(struct rt6_info *rt, unsigned long old)
-{
-	struct dst_entry *dst = &rt->dst;
-	struct inet_peer *peer;
-	u32 *p = NULL;
-
-	if (!(rt->dst.flags & DST_HOST))
-		return dst_cow_metrics_generic(dst, old);
-
-	peer = rt6_get_peer_create(rt);
-	if (peer) {
-		u32 *old_p = __DST_METRICS_PTR(old);
-		unsigned long prev, new;
-
-		p = peer->metrics;
-		if (inet_metrics_new(peer) ||
-		    (old & DST_METRICS_FORCE_OVERWRITE))
-			memcpy(p, old_p, sizeof(u32) * RTAX_MAX);
-
-		new = (unsigned long) p;
-		prev = cmpxchg(&dst->_metrics, old, new);
-
-		if (prev != old) {
-			p = __DST_METRICS_PTR(prev);
-			if (prev & DST_METRICS_READ_ONLY)
-				p = NULL;
-		}
-	}
-	return p;
-}
-
 static u32 *ipv6_cow_metrics(struct dst_entry *dst, unsigned long old)
 {
 	struct rt6_info *rt = (struct rt6_info *)dst;
 
 	if (rt->rt6i_flags & RTF_PCPU)
 		return rt6_pcpu_cow_metrics(rt);
+	else if (rt->rt6i_flags & RTF_CACHE)
+		return NULL;
 	else
-		return rt6_cow_metrics(rt, old);
+		return dst_cow_metrics_generic(dst, old);
 }
 
 static inline const void *choose_neigh_daddr(struct rt6_info *rt,
@@ -370,8 +341,7 @@ static void ip6_dst_destroy(struct dst_entry *dst)
 	struct inet6_dev *idev = rt->rt6i_idev;
 	struct dst_entry *from = dst->from;
 
-	if (!(rt->dst.flags & DST_HOST))
-		dst_destroy_metrics_generic(dst);
+	dst_destroy_metrics_generic(dst);
 
 	if (rt->rt6i_pcpu)
 		free_percpu(rt->rt6i_pcpu);
@@ -383,11 +353,6 @@ static void ip6_dst_destroy(struct dst_entry *dst)
 
 	dst->from = NULL;
 	dst_release(from);
-
-	if (rt6_has_peer(rt)) {
-		struct inet_peer *peer = rt6_peer_ptr(rt);
-		inet_putpeer(peer);
-	}
 }
 
 static void ip6_dst_ifdown(struct dst_entry *dst, struct net_device *dev,
@@ -982,8 +947,6 @@ static struct rt6_info *ip6_rt_pcpu_alloc(struct rt6_info *rt)
 	if (!pcpu_rt)
 		return NULL;
 	ip6_rt_copy_init(pcpu_rt, rt, NULL);
-	dst_init_metrics(&pcpu_rt->dst, dst_metrics_ptr(&rt->dst), true);
-	rt6_set_from(pcpu_rt, rt);
 	pcpu_rt->rt6i_protocol = rt->rt6i_protocol;
 	pcpu_rt->rt6i_flags |= RTF_PCPU;
 	return pcpu_rt;
@@ -994,8 +957,13 @@ static struct rt6_info *rt6_get_pcpu_route(struct rt6_info *rt)
 	struct rt6_info *pcpu_rt, *orig, *prev, **p;
 	struct net *net = dev_net(rt->dst.dev);
 
-	if (rt == net->ipv6.ip6_null_entry || rt->rt6i_flags & RTF_CACHE)
+	if (rt == net->ipv6.ip6_null_entry)
 		goto done;
+
+	if (rt->rt6i_flags & RTF_CACHE) {
+		rt6_dst_from_metrics_check(rt);
+		goto done;
+	}
 
 	rcu_read_lock();
 	p = raw_cpu_ptr(rt->rt6i_pcpu);
@@ -1192,11 +1160,9 @@ static struct dst_entry *rt6_check(struct rt6_info *rt, u32 cookie)
 
 static struct dst_entry *rt6_pcpu_check(struct rt6_info *rt, u32 cookie)
 {
-	if (rt->dst.obsolete == DST_OBSOLETE_FORCE_CHK) {
-		rt6_dst_from_metrics_check(rt);
-		if (rt6_check((struct rt6_info *)(rt->dst.from), cookie))
-			return &rt->dst;
-	}
+	if (rt->dst.obsolete == DST_OBSOLETE_FORCE_CHK &&
+	    rt6_check((struct rt6_info *)(rt->dst.from), cookie))
+		return &rt->dst;
 	return NULL;
 }
 
@@ -1205,6 +1171,9 @@ static struct dst_entry *ip6_dst_check(struct dst_entry *dst, u32 cookie)
 	struct rt6_info *rt;
 
 	rt = (struct rt6_info *) dst;
+
+	if (dst->from)
+		rt6_dst_from_metrics_check(rt);
 
 	/* All IPV6 dsts are created with ->obsolete set to the value
 	 * DST_OBSOLETE_FORCE_CHK which forces validation calls down
@@ -1299,7 +1268,7 @@ static void ip6_rt_update_pmtu(struct dst_entry *dst, struct sock *sk,
 
 	net = dev_net(rt6->dst.dev);
 	rt6->rt6i_flags |= RTF_MODIFIED;
-	dst_metric_set(dst, RTAX_MTU, mtu);
+	rt6->rt6i_pmtu = mtu;
 	rt6_update_expires(rt6, net->ipv6.sysctl.ip6_rt_mtu_expires);
 }
 
@@ -1485,9 +1454,14 @@ static unsigned int ip6_default_advmss(const struct dst_entry *dst)
 
 static unsigned int ip6_mtu(const struct dst_entry *dst)
 {
+	const struct rt6_info *rt = (const struct rt6_info *)dst;
+	unsigned int mtu = rt->rt6i_pmtu;
 	struct inet6_dev *idev;
-	unsigned int mtu = dst_metric_raw(dst, RTAX_MTU);
 
+	if (mtu)
+		goto out;
+
+	mtu = dst_metric_raw(dst, RTAX_MTU);
 	if (mtu)
 		goto out;
 
@@ -2073,6 +2047,16 @@ out:
  *	Misc support functions
  */
 
+static void rt6_set_from(struct rt6_info *rt, struct rt6_info *from)
+{
+	BUG_ON(from->rt6i_flags & (RTF_CACHE | RTF_PCPU));
+
+	rt->rt6i_flags &= ~RTF_EXPIRES;
+	dst_hold(&from->dst);
+	rt->dst.from = &from->dst;
+	dst_init_metrics(&rt->dst, dst_metrics_ptr(&from->dst), true);
+}
+
 static void ip6_rt_copy_init(struct rt6_info *rt,
 			     struct rt6_info *ort,
 			     const struct in6_addr *dest)
@@ -2100,6 +2084,7 @@ static void ip6_rt_copy_init(struct rt6_info *rt,
 #endif
 	rt->rt6i_prefsrc = ort->rt6i_prefsrc;
 	rt->rt6i_table = ort->rt6i_table;
+	rt6_set_from(rt, ort);
 }
 
 static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
@@ -2107,7 +2092,7 @@ static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 {
 	struct rt6_info *rt;
 
-	if (ort->rt6i_flags & RTF_PCPU)
+	if (ort->rt6i_flags & (RTF_PCPU | RTF_CACHE))
 		ort = (struct rt6_info *)ort->dst.from;
 
 	rt = __ip6_dst_alloc(dev_net(ort->dst.dev), ort->dst.dev,
@@ -2116,9 +2101,7 @@ static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 	if (!rt)
 		return NULL;
 	ip6_rt_copy_init(rt, ort, dest);
-	dst_copy_metrics(&rt->dst, &ort->dst);
 	rt->rt6i_flags |= RTF_CACHE;
-	rt6_set_from(rt, ort);
 	rt->rt6i_metric = 0;
 	return rt;
 }
@@ -2531,11 +2514,20 @@ static int rt6_mtu_change_route(struct rt6_info *rt, void *p_arg)
 	   PMTU discouvery.
 	 */
 	if (rt->dst.dev == arg->dev &&
-	    !dst_metric_locked(&rt->dst, RTAX_MTU) &&
-	    (dst_mtu(&rt->dst) >= arg->mtu ||
-	     (dst_mtu(&rt->dst) < arg->mtu &&
-	      dst_mtu(&rt->dst) == idev->cnf.mtu6))) {
-		dst_metric_set(&rt->dst, RTAX_MTU, arg->mtu);
+	    !dst_metric_locked(&rt->dst, RTAX_MTU)) {
+		if (rt->rt6i_flags & RTF_CACHE) {
+			/* For RTF_CACHE with rt6i_pmtu == 0
+			 * (i.e. a redirected route),
+			 * the metrics of its rt->dst.from has already
+			 * been updated.
+			 */
+			if (rt->rt6i_pmtu && rt->rt6i_pmtu > arg->mtu)
+				rt->rt6i_pmtu = arg->mtu;
+		} else if (dst_mtu(&rt->dst) >= arg->mtu ||
+			   (dst_mtu(&rt->dst) < arg->mtu &&
+			    dst_mtu(&rt->dst) == idev->cnf.mtu6)) {
+			dst_metric_set(&rt->dst, RTAX_MTU, arg->mtu);
+		}
 	}
 	return 0;
 }
@@ -2765,6 +2757,7 @@ static int rt6_fill_node(struct net *net,
 			 int iif, int type, u32 portid, u32 seq,
 			 int prefix, int nowait, unsigned int flags)
 {
+	u32 metrics[RTAX_MAX];
 	struct rtmsg *rtm;
 	struct nlmsghdr *nlh;
 	long expires;
@@ -2878,7 +2871,10 @@ static int rt6_fill_node(struct net *net,
 			goto nla_put_failure;
 	}
 
-	if (rtnetlink_put_metrics(skb, dst_metrics_ptr(&rt->dst)) < 0)
+	memcpy(metrics, dst_metrics_ptr(&rt->dst), sizeof(metrics));
+	if (rt->rt6i_pmtu)
+		metrics[RTAX_MTU - 1] = rt->rt6i_pmtu;
+	if (rtnetlink_put_metrics(skb, metrics) < 0)
 		goto nla_put_failure;
 
 	if (rt->rt6i_flags & RTF_GATEWAY) {
