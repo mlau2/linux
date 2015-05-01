@@ -104,11 +104,18 @@ static struct rt6_info *rt6_get_route_info(struct net *net,
 					   const struct in6_addr *gwaddr, int ifindex);
 #endif
 
+static u32 *rt6_pcpu_cow_metrics(struct rt6_info *rt)
+{
+	return dst_metrics_write_ptr(rt->dst.from);
+}
+
 static u32 *ipv6_cow_metrics(struct dst_entry *dst, unsigned long old)
 {
 	struct rt6_info *rt = (struct rt6_info *)dst;
 
-	if (rt->rt6i_flags & RTF_CACHE)
+	if (rt->rt6i_flags & RTF_PCPU)
+		return rt6_pcpu_cow_metrics(rt);
+	else if (rt->rt6i_flags & RTF_CACHE)
 		return NULL;
 	else
 		return dst_cow_metrics_generic(dst, old);
@@ -248,10 +255,10 @@ static const struct rt6_info ip6_blk_hole_entry_template = {
 #endif
 
 /* allocate dst with ip6_dst_ops */
-static inline struct rt6_info *ip6_dst_alloc(struct net *net,
-					     struct net_device *dev,
-					     int flags,
-					     struct fib6_table *table)
+static struct rt6_info *__ip6_dst_alloc(struct net *net,
+					struct net_device *dev,
+					int flags,
+					struct fib6_table *table)
 {
 	struct rt6_info *rt = dst_alloc(&net->ipv6.ip6_dst_ops, dev,
 					0, DST_OBSOLETE_FORCE_CHK, flags);
@@ -265,6 +272,34 @@ static inline struct rt6_info *ip6_dst_alloc(struct net *net,
 	return rt;
 }
 
+static struct rt6_info *ip6_dst_alloc(struct net *net,
+				      struct net_device *dev,
+				      int flags,
+				      struct fib6_table *table)
+{
+	struct rt6_info *rt = __ip6_dst_alloc(net, dev, flags, table);
+
+	if (rt) {
+		rt->rt6i_pcpu = alloc_percpu_gfp(struct rt6_info *, GFP_ATOMIC);
+		if (rt->rt6i_pcpu) {
+			int cpu;
+
+			for_each_possible_cpu(cpu) {
+				struct rt6_info **p;
+
+				p = per_cpu_ptr(rt->rt6i_pcpu, cpu);
+				/* no one shares rt */
+				*p =  NULL;
+			}
+		} else {
+			dst_destroy((struct dst_entry *)rt);
+			return NULL;
+		}
+	}
+
+	return rt;
+}
+
 static void ip6_dst_destroy(struct dst_entry *dst)
 {
 	struct rt6_info *rt = (struct rt6_info *)dst;
@@ -272,6 +307,9 @@ static void ip6_dst_destroy(struct dst_entry *dst)
 	struct dst_entry *from = dst->from;
 
 	dst_destroy_metrics_generic(dst);
+
+	if (rt->rt6i_pcpu)
+		free_percpu(rt->rt6i_pcpu);
 
 	if (idev) {
 		rt->rt6i_idev = NULL;
@@ -847,11 +885,11 @@ static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 	 *	Clone the route.
 	 */
 
-	if (ort->rt6i_flags & RTF_CACHE)
+	if (ort->rt6i_flags & (RTF_CACHE | RTF_PCPU))
 		ort = (struct rt6_info *)ort->dst.from;
 
-	rt = ip6_dst_alloc(dev_net(ort->dst.dev), ort->dst.dev,
-			   0, ort->rt6i_table);
+	rt = __ip6_dst_alloc(dev_net(ort->dst.dev), ort->dst.dev,
+			     0, ort->rt6i_table);
 
 	if (!rt)
 		return NULL;
@@ -876,6 +914,57 @@ static struct rt6_info *ip6_rt_cache_alloc(struct rt6_info *ort,
 	}
 
 	return rt;
+}
+
+static struct rt6_info *ip6_rt_pcpu_alloc(struct rt6_info *rt)
+{
+	struct rt6_info *pcpu_rt;
+
+	pcpu_rt = __ip6_dst_alloc(dev_net(rt->dst.dev),
+				  rt->dst.dev, rt->dst.flags,
+				  rt->rt6i_table);
+
+	if (!pcpu_rt)
+		return NULL;
+	ip6_rt_copy_init(pcpu_rt, rt);
+	pcpu_rt->rt6i_protocol = rt->rt6i_protocol;
+	pcpu_rt->rt6i_flags |= RTF_PCPU;
+	return pcpu_rt;
+}
+
+static struct rt6_info *rt6_get_pcpu_route(struct rt6_info *rt)
+{
+	struct rt6_info *pcpu_rt, *orig, *prev, **p;
+	struct net *net = dev_net(rt->dst.dev);
+
+	rcu_read_lock();
+	p = raw_cpu_ptr(rt->rt6i_pcpu);
+	orig = rcu_dereference_check(*p,
+				     lockdep_is_held(&rt->rt6i_table->tb6_lock));
+	if (orig) {
+		dst_hold(&orig->dst);
+		rcu_read_unlock();
+		rt6_dst_from_metrics_check(orig);
+		return orig;
+	}
+	rcu_read_unlock();
+
+	pcpu_rt = ip6_rt_pcpu_alloc(rt);
+	if (!pcpu_rt) {
+		rt = net->ipv6.ip6_null_entry;
+		dst_hold(&rt->dst);
+		return rt;
+	}
+	dst_hold(&pcpu_rt->dst);
+
+	prev = cmpxchg(p, orig, pcpu_rt);
+	if (prev == orig) {
+		if (orig)
+			call_rcu(&orig->dst.rcu_head, dst_rcu_free);
+	} else {
+		pcpu_rt->dst.flags |= DST_NOCACHE;
+	}
+	return pcpu_rt;
 }
 
 static struct rt6_info *ip6_pol_route(struct net *net, struct fib6_table *table, int oif,
@@ -910,11 +999,13 @@ redo_rt6_select:
 		}
 	}
 
-	dst_use(&rt->dst, jiffies);
-	read_unlock_bh(&table->tb6_lock);
 
 	if (rt == net->ipv6.ip6_null_entry || (rt->rt6i_flags & RTF_CACHE)) {
-		goto done;
+		dst_use(&rt->dst, jiffies);
+		read_unlock_bh(&table->tb6_lock);
+
+		rt6_dst_from_metrics_check(rt);
+		return rt;
 	} else if (unlikely((fl6->flowi6_flags & FLOWI_FLAG_KNOWN_NH) &&
 			    !(rt->rt6i_flags & RTF_GATEWAY))) {
 		/* Create a RTF_CACHE clone which will not be
@@ -925,6 +1016,9 @@ redo_rt6_select:
 
 		struct rt6_info *uncached_rt;
 
+		dst_use(&rt->dst, jiffies);
+		read_unlock_bh(&table->tb6_lock);
+
 		uncached_rt = ip6_rt_cache_alloc(rt, &fl6->daddr, NULL);
 		dst_release(&rt->dst);
 
@@ -932,13 +1026,22 @@ redo_rt6_select:
 			uncached_rt->dst.flags |= DST_NOCACHE;
 		else
 			uncached_rt = net->ipv6.ip6_null_entry;
+
 		dst_hold(&uncached_rt->dst);
 		return uncached_rt;
-	}
 
-done:
-	rt6_dst_from_metrics_check(rt);
-	return rt;
+	} else {
+		/* Get a percpu copy */
+
+		struct rt6_info *pcpu_rt;
+
+		rt->dst.lastuse = jiffies;
+		rt->dst.__use++;
+		pcpu_rt = rt6_get_pcpu_route(rt);
+		read_unlock_bh(&table->tb6_lock);
+
+		return pcpu_rt;
+	}
 }
 
 static struct rt6_info *ip6_pol_route_input(struct net *net, struct fib6_table *table,
@@ -1082,7 +1185,7 @@ static struct dst_entry *ip6_dst_check(struct dst_entry *dst, u32 cookie)
 
 	rt6_dst_from_metrics_check(rt);
 
-	if (unlikely(dst->flags & DST_NOCACHE))
+	if ((rt->rt6i_flags & RTF_PCPU) || unlikely(dst->flags & DST_NOCACHE))
 		return rt6_dst_from_check(rt, cookie);
 	else
 		return rt6_check(rt, cookie);
